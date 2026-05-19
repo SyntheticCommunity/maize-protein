@@ -1,0 +1,638 @@
+---
+title: "玉米不同品种不同部位蛋白质含量分析"
+subtitle: "汉玉122 vs 郑单958 | VE—V5 生育时期"
+author: "数据分析报告"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: true
+    code-tools: true
+    theme: flatly
+    fig-width: 10
+    fig-height: 6
+execute:
+  warning: false
+  message: false
+---
+
+## 引言
+
+本报告分析两种玉米品种（**汉玉122** 和 **郑单958**）在营养生长期（VE—V5）不同器官的蛋白质含量差异及其动态变化。数据包含 5 个生育时期的 5 类器官（叶、茎、根、胚、胚乳）的蛋白质含量测定结果，每组 3 个生物学重复。
+
+**研究问题：**
+
+1. 不同器官之间的蛋白质含量是否存在显著差异？
+2. 蛋白质含量在生育过程中如何变化？
+3. 两个品种之间是否存在系统性差异？
+4. 叶片内部的蛋白质空间分布规律是什么？
+5. 不同茎节之间的蛋白质含量是否存在梯度？
+
+
+# 数据读取与预处理
+
+## 读取原始数据
+
+```{r}
+#| label: setup
+#| code-summary: "加载R包与辅助函数"
+
+library(tidyverse)
+library(emmeans)
+library(scales)
+library(patchwork)
+library(knitr)
+library(kableExtra)
+library(jsonlite)
+
+# 器官配色
+organ_colors <- c(
+  "Leaf" = "#4DAF4A", "Stem" = "#377EB8", "Root" = "#E41A1C",
+  "Embryo" = "#FF7F00", "Endosperm" = "#984EA3"
+)
+
+# 读取图片解读 JSON（首次渲染时文件不存在，跳过）
+interpretations_file <- "data/figure_interpretations.json"
+if (file.exists(interpretations_file)) {
+  interpretations <- fromJSON(interpretations_file)
+} else {
+  interpretations <- NULL
+}
+
+# 显示解读结果的辅助函数
+show_interpretation <- function(label) {
+  if (!is.null(interpretations) && label %in% names(interpretations)) {
+    cat(interpretations[[label]], "\n\n")
+  }
+}
+```
+
+```{r}
+#| label: read-data
+
+raw <- read_csv(
+  "data/maize-protein-content.csv",
+  col_types = cols(
+    .default = col_double(),
+    variety  = col_character(),
+    part     = col_character(),
+    stage    = col_character()
+  )
+)
+
+raw <- raw |>
+  select(-where(~ all(is.na(.)))) |>
+  rename(replicate = relicate)
+
+glimpse(raw)
+```
+
+## 数据清洗
+
+```{r}
+#| label: data-clean
+
+df <- raw |>
+  mutate(
+    time = factor(time, levels = sort(unique(time))),
+    stage = factor(stage, levels = c("VE", "V2", "V3", "V4", "V5")),
+    variety_en = case_when(
+      variety == "汉玉122" ~ "HY122",
+      variety == "郑单958" ~ "ZD958",
+      TRUE ~ variety
+    ) |> factor(levels = c("HY122", "ZD958")),
+    organ = case_when(
+      part == "L"                 ~ "Leaf",
+      part == "S"                 ~ "Stem",
+      part == "R"                 ~ "Root",
+      part == "Em"                ~ "Embryo",
+      part == "En"                ~ "Endosperm",
+      str_detect(part, "^L\\d")   ~ "Leaf",
+      str_detect(part, "^S")      ~ "Stem",
+      TRUE                        ~ NA_character_
+    ),
+    leaf_number = case_when(
+      part == "L"                 ~ NA_real_,
+      str_detect(part, "^L(\\d)") ~ str_extract(part, "(?<=^L)\\d") |> as.numeric(),
+      TRUE                        ~ NA_real_
+    ),
+    distance = case_when(
+      str_detect(part, "^L\\d([a-z])") ~ str_extract(part, "(?<=^L\\d)[a-z]"),
+      str_detect(part, "^S([a-z])")    ~ str_extract(part, "(?<=^S)[a-z]"),
+      TRUE                              ~ NA_character_
+    ),
+    stem_node = case_when(
+      str_detect(part, "^S([a-z])") ~ str_extract(part, "(?<=^S)[a-z]"),
+      TRUE                          ~ NA_character_
+    )
+  )
+
+# 创建 figures 目录并设定导出路径
+dir.create("figures", showWarnings = FALSE)
+fig_dir <- "figures"
+pptx_file <- "figures/protein_analysis.pptx"
+```
+
+## 数据概览
+
+```{r}
+#| label: data-summary
+
+cat("观测数：", nrow(df), "\n")
+cat("品种：", str_c(unique(df$variety), collapse = "、"), "\n")
+cat("生育时期：", str_c(levels(df$stage), collapse = " → "), "\n")
+cat("器官类型：", str_c(sort(unique(df$organ)), collapse = "、"), "\n")
+
+df |>
+  count(variety, stage, organ) |>
+  pivot_wider(names_from = variety, values_from = n, values_fill = 0) |>
+  kable(col.names = c("Stage", "Organ", "HY122", "ZD958"),
+        caption = "各品种-时期-器官组合的样本数 / Sample counts by variety, stage, and organ") |>
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+
+# 主分析：器官水平
+
+## 器官间蛋白质含量差异
+
+```{r}
+#| label: fig-organ-boxplot
+#| fig-cap: "**各器官蛋白质含量分布（全时期合并）** Distribution of protein content across five organ types for each variety, pooled over all growth stages. X-axis: organ type; Y-axis: protein content (mg/g); boxplots show median, IQR, and outliers; facets separate the two varieties."
+#| fig-width: 10
+#| fig-height: 5
+
+p_organ <- ggplot(df, aes(x = organ, y = protein_content, fill = organ)) +
+  geom_boxplot(alpha = 0.7, outlier.size = 1) +
+  facet_wrap(~ variety_en, ncol = 2) +
+  scale_fill_manual(values = organ_colors) +
+  labs(x = "Organ", y = "Protein content (mg/g)", fill = "Organ",
+       title = "Protein content by organ and variety") +
+  theme_bw(base_size = 13) +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 30, hjust = 1))
+
+p_organ
+ggsave(file.path(fig_dir, "fig-organ-boxplot.png"), p_organ, width = 10, height = 5, dpi = 300)
+export::graph2ppt(p_organ, file = pptx_file, width = 10, height = 5, append = TRUE)
+```
+
+```{r}
+#| label: result-organ-boxplot
+#| results: asis
+#| eval: true
+
+show_interpretation("fig-organ-boxplot")
+```
+
+```{r}
+#| label: anova-organ
+#| code-summary: "器官与品种双因素方差分析"
+
+aov_organ <- aov(protein_content ~ organ * variety, data = df)
+summary(aov_organ)
+```
+
+```{r}
+#| label: emmeans-organ
+#| code-summary: "器官间两两比较"
+
+emm_organ <- emmeans(aov_organ, ~ organ)
+pairs(emm_organ, adjust = "tukey") |>
+  as_tibble() |>
+  mutate(
+    sig = case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01  ~ "**",
+      p.value < 0.05  ~ "*",
+      TRUE             ~ "ns"
+    )
+  ) |>
+  kable(digits = 4,
+        caption = "器官间蛋白质含量多重比较（Tukey HSD）/ Pairwise comparisons of protein content between organs") |>
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+
+## 蛋白质含量随生育时期的变化
+
+```{r}
+#| label: fig-stage-trend
+#| fig-cap: "**各器官蛋白质含量的生育时期变化趋势** Mean protein content (±SE) of each organ type across growth stages (VE to V5). X-axis: growth stage; Y-axis: protein content (mg/g); points connected by lines represent organ-specific trajectories; error bars represent standard error; facets separate the two varieties."
+#| fig-width: 12
+#| fig-height: 8
+
+stage_means <- df |>
+  group_by(variety_en, stage, organ) |>
+  summarise(
+    mean_se = mean(protein_content),
+    se      = sd(protein_content) / sqrt(n()),
+    .groups = "drop"
+  )
+
+p_stage <- ggplot(stage_means, aes(x = stage, y = mean_se, color = organ, group = organ)) +
+  geom_point(size = 2.5) +
+  geom_line(linewidth = 0.8) +
+  geom_errorbar(aes(ymin = mean_se - se, ymax = mean_se + se),
+                width = 0.15, linewidth = 0.5) +
+  facet_wrap(~ variety_en, ncol = 1) +
+  scale_color_manual(values = organ_colors) +
+  labs(x = "Growth stage", y = "Protein content (mg/g, Mean ± SE)",
+       color = "Organ",
+       title = "Protein content trend across growth stages") +
+  theme_bw(base_size = 13) +
+  theme(legend.position = "bottom")
+
+p_stage
+ggsave(file.path(fig_dir, "fig-stage-trend.png"), p_stage, width = 12, height = 8, dpi = 300)
+export::graph2ppt(p_stage, file = pptx_file, width = 12, height = 8, append = TRUE)
+```
+
+```{r}
+#| label: result-stage-trend
+#| results: asis
+#| eval: true
+
+show_interpretation("fig-stage-trend")
+```
+
+```{r}
+#| label: anova-stage
+#| code-summary: "三因素方差分析（organ × stage × variety）"
+
+aov_full <- aov(protein_content ~ organ * stage * variety, data = df)
+summary(aov_full)
+```
+
+
+## 品种间差异比较
+
+```{r}
+#| label: fig-variety-heatmap
+#| fig-cap: "**品种间蛋白质含量差异热图** Heatmap of mean protein content difference between HY122 and ZD958 (HY122 minus ZD958) by organ and growth stage. X-axis: organ type; Y-axis: growth stage; color scale: blue (ZD958 higher) to red (HY122 higher); cell labels show numerical difference in mg/g."
+#| fig-width: 10
+#| fig-height: 5
+
+variety_diff <- df |>
+  group_by(stage, organ) |>
+  summarise(
+    mean_hy = mean(protein_content[variety == "汉玉122"]),
+    mean_zd = mean(protein_content[variety == "郑单958"]),
+    diff    = mean_hy - mean_zd,
+    .groups = "drop"
+  )
+
+p_heatmap <- ggplot(variety_diff, aes(x = organ, y = stage, fill = diff)) +
+  geom_tile(color = "white", linewidth = 0.8) +
+  geom_text(aes(label = sprintf("%.2f", diff)), size = 3.5) +
+  scale_fill_gradient2(
+    low = "#2166AC", mid = "white", high = "#B2182B",
+    midpoint = 0, name = "Mean diff\n(mg/g)"
+  ) +
+  labs(x = "Organ", y = "Growth stage",
+       title = "Protein content difference (HY122 − ZD958, mg/g)") +
+  theme_bw(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+p_heatmap
+ggsave(file.path(fig_dir, "fig-variety-heatmap.png"), p_heatmap, width = 10, height = 5, dpi = 300)
+export::graph2ppt(p_heatmap, file = pptx_file, width = 10, height = 5, append = TRUE)
+```
+
+```{r}
+#| label: result-variety-heatmap
+#| results: asis
+#| eval: true
+
+show_interpretation("fig-variety-heatmap")
+```
+
+```{r}
+#| label: fig-variety-paired
+#| fig-cap: "**各生育时期两品种蛋白质含量对比** Side-by-side boxplots comparing protein content between HY122 and ZD958 for each organ, faceted by growth stage. X-axis: organ type; Y-axis: protein content (mg/g); red: HY122; blue: ZD958; boxplots show median, IQR, and outliers."
+#| fig-width: 12
+#| fig-height: 8
+
+p_paired <- ggplot(df, aes(x = organ, y = protein_content, fill = variety_en)) +
+  geom_boxplot(alpha = 0.7, position = position_dodge(width = 0.8)) +
+  facet_wrap(~ stage, ncol = 3) +
+  scale_fill_manual(values = c("HY122" = "#E41A1C", "ZD958" = "#377EB8")) +
+  labs(x = "Organ", y = "Protein content (mg/g)", fill = "Variety",
+       title = "Protein content comparison by variety across stages") +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 40, hjust = 1))
+
+p_paired
+ggsave(file.path(fig_dir, "fig-variety-paired.png"), p_paired, width = 12, height = 8, dpi = 300)
+export::graph2ppt(p_paired, file = pptx_file, width = 12, height = 8, append = TRUE)
+```
+
+```{r}
+#| label: result-variety-paired
+#| results: asis
+#| eval: true
+
+show_interpretation("fig-variety-paired")
+```
+
+
+# 细粒度分析：叶位与茎节（V2—V5）
+
+以下分析聚焦 V2—V5 时期具有细粒度编号的叶片与茎节数据。
+
+```{r}
+#| label: subset-vg
+#| code-summary: "筛选 V2-V5 细粒度数据"
+
+df_leaf <- df |>
+  filter(stage != "VE", organ == "Leaf", !is.na(leaf_number))
+
+df_stem <- df |>
+  filter(stage != "VE", organ == "Stem", !is.na(stem_node))
+```
+
+
+## 叶序与蛋白质含量
+
+```{r}
+#| label: fig-leaf-position
+#| fig-cap: "**不同叶序的蛋白质含量分布** Protein content distribution by leaf number across growth stages. X-axis: leaf order (1 = lowest, higher = upper leaves); Y-axis: protein content (mg/g); red: HY122; blue: ZD958; facets separate growth stages; y-axis scales are free across facets."
+#| fig-width: 12
+#| fig-height: 8
+
+p_leaf <- ggplot(df_leaf, aes(x = factor(leaf_number), y = protein_content,
+                     fill = variety_en)) +
+  geom_boxplot(alpha = 0.7, position = position_dodge(width = 0.8)) +
+  facet_wrap(~ stage, ncol = 3, scales = "free_y") +
+  scale_fill_manual(values = c("HY122" = "#E41A1C", "ZD958" = "#377EB8")) +
+  labs(x = "Leaf order (bottom to top)", y = "Protein content (mg/g)", fill = "Variety",
+       title = "Protein content by leaf position (V2-V5)") +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "bottom")
+
+p_leaf
+ggsave(file.path(fig_dir, "fig-leaf-position.png"), p_leaf, width = 12, height = 8, dpi = 300)
+export::graph2ppt(p_leaf, file = pptx_file, width = 12, height = 8, append = TRUE)
+```
+
+```{r}
+#| label: result-leaf-position
+#| results: asis
+#| eval: true
+
+show_interpretation("fig-leaf-position")
+```
+
+
+## 叶内蛋白质空间梯度
+
+```{r}
+#| label: fig-leaf-gradient
+#| fig-cap: "**叶片内离茎距离对蛋白质含量的影响** Intra-leaf protein spatial gradient by distance from stem. X-axis: distance from stem (a = nearest, f = farthest); Y-axis: protein content (mg/g); color-coded by distance; rows: growth stages; columns: variety and leaf number; y-axis scales are free."
+#| fig-width: 12
+#| fig-height: 10
+
+distance_colors <- c("a" = "#1B7837", "b" = "#762A83",
+                      "c" = "#E08214", "d" = "#2166AC",
+                      "e" = "#B2182B", "f" = "#1A1A1A")
+
+p_gradient <- df_leaf |>
+  filter(!is.na(distance)) |>
+  ggplot(aes(x = distance, y = protein_content, color = distance)) +
+  geom_boxplot(alpha = 0.6, show.legend = FALSE) +
+  facet_grid(stage ~ variety_en + factor(leaf_number), scales = "free") +
+  scale_color_manual(values = distance_colors) +
+  labs(x = "Distance from stem (a = near → f = far)", y = "Protein content (mg/g)",
+       title = "Intra-leaf protein spatial gradient (by leaf and stage)") +
+  theme_bw(base_size = 11)
+
+p_gradient
+ggsave(file.path(fig_dir, "fig-leaf-gradient.png"), p_gradient, width = 12, height = 10, dpi = 300)
+export::graph2ppt(p_gradient, file = pptx_file, width = 12, height = 10, append = TRUE)
+```
+
+```{r}
+#| label: result-leaf-gradient
+#| results: asis
+#| eval: true
+
+show_interpretation("fig-leaf-gradient")
+```
+
+
+## 茎节差异
+
+```{r}
+#| label: fig-stem-node
+#| fig-cap: "**不同茎节的蛋白质含量分布** Protein content by stem node position across growth stages. X-axis: stem node (a = basal, e = upper); Y-axis: protein content (mg/g); red: HY122; blue: ZD958; facets separate growth stages; y-axis scales are free."
+#| fig-width: 10
+#| fig-height: 8
+
+p_stem <- ggplot(df_stem, aes(x = stem_node, y = protein_content, fill = variety_en)) +
+  geom_boxplot(alpha = 0.7, position = position_dodge(width = 0.8)) +
+  facet_wrap(~ stage, ncol = 3, scales = "free_y") +
+  scale_fill_manual(values = c("HY122" = "#E41A1C", "ZD958" = "#377EB8")) +
+  labs(x = "Stem node (a = basal → e = upper)", y = "Protein content (mg/g)", fill = "Variety",
+       title = "Protein content by stem node (V2-V5)") +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "bottom")
+
+p_stem
+ggsave(file.path(fig_dir, "fig-stem-node.png"), p_stem, width = 10, height = 8, dpi = 300)
+export::graph2ppt(p_stem, file = pptx_file, width = 10, height = 8, append = TRUE)
+```
+
+```{r}
+#| label: result-stem-node
+#| results: asis
+#| eval: true
+
+show_interpretation("fig-stem-node")
+```
+
+
+# 补充分析
+
+## 器官蛋白质分配模式
+
+```{r}
+#| label: fig-allocation
+#| fig-cap: "**各品种器官蛋白质分配比例** Stacked proportion of mean protein content allocated to each organ type. X-axis: growth stage; Y-axis: proportion of total protein content (%); colors represent organ types; facets separate the two varieties."
+#| fig-width: 10
+#| fig-height: 6
+
+alloc <- df |>
+  group_by(variety_en, stage, organ) |>
+  summarise(mean_p = mean(protein_content), .groups = "drop") |>
+  group_by(variety_en, stage) |>
+  mutate(prop = mean_p / sum(mean_p)) |>
+  ungroup()
+
+p_alloc <- ggplot(alloc, aes(x = stage, y = prop, fill = organ)) +
+  geom_col(position = "stack", alpha = 0.85) +
+  facet_wrap(~ variety_en, ncol = 2) +
+  scale_fill_manual(values = organ_colors) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(x = "Growth stage", y = "Protein content proportion", fill = "Organ",
+       title = "Organ protein allocation across stages") +
+  theme_bw(base_size = 13) +
+  theme(legend.position = "bottom")
+
+p_alloc
+ggsave(file.path(fig_dir, "fig-allocation.png"), p_alloc, width = 10, height = 6, dpi = 300)
+export::graph2ppt(p_alloc, file = pptx_file, width = 10, height = 6, append = TRUE)
+```
+
+```{r}
+#| label: result-allocation
+#| results: asis
+#| eval: true
+
+show_interpretation("fig-allocation")
+```
+
+
+## 胚与胚乳蛋白质含量动态
+
+```{r}
+#| label: fig-seed-protein
+#| fig-cap: "**胚与胚乳蛋白质含量在营养生长期的变化** Embryo and endosperm protein content at VE and V2. X-axis: growth stage; Y-axis: protein content (mg/g); orange: Embryo; purple: Endosperm; circles: HY122; triangles: ZD958; diamonds: group means."
+#| fig-width: 8
+#| fig-height: 5
+
+df_seed <- df |>
+  filter(organ %in% c("Embryo", "Endosperm"))
+
+p_seed <- ggplot(df_seed, aes(x = stage, y = protein_content,
+                     color = organ, shape = variety_en)) +
+  geom_jitter(width = 0.15, size = 2, alpha = 0.7) +
+  stat_summary(aes(group = interaction(organ, variety_en)),
+               fun = mean, geom = "point", size = 4, shape = 18) +
+  scale_color_manual(values = c("Embryo" = "#FF7F00", "Endosperm" = "#984EA3")) +
+  scale_shape_manual(values = c("HY122" = 16, "ZD958" = 17)) +
+  labs(x = "Growth stage", y = "Protein content (mg/g)", color = "Organ",
+       title = "Embryo and endosperm protein content dynamics") +
+  theme_bw(base_size = 13) +
+  theme(legend.position = "bottom")
+
+p_seed
+ggsave(file.path(fig_dir, "fig-seed-protein.png"), p_seed, width = 8, height = 5, dpi = 300)
+export::graph2ppt(p_seed, file = pptx_file, width = 8, height = 5, append = TRUE)
+```
+
+```{r}
+#| label: result-seed-protein
+#| results: asis
+#| eval: true
+
+show_interpretation("fig-seed-protein")
+```
+
+
+## 叶内蛋白质梯度强度量化
+
+```{r}
+#| label: gradient-summary
+#| code-summary: "计算各叶片的近远梯度斜率"
+
+gradient_data <- df_leaf |>
+  filter(!is.na(distance)) |>
+  mutate(dist_num = match(distance, letters[1:10])) |>
+  group_by(variety, stage, leaf_number) |>
+  summarise(
+    slope = coef(lm(protein_content ~ dist_num))[2],
+    r2    = summary(lm(protein_content ~ dist_num))$r.squared,
+    n     = n(),
+    .groups = "drop"
+  )
+
+gradient_data |>
+  mutate(sig = ifelse(r2 > 0.3, "Strong", "Weak")) |>
+  kable(digits = 3,
+        caption = "叶片内蛋白质梯度 / Intra-leaf protein gradient (slope = change per unit distance)") |>
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+
+## 蛋白质含量变异系数分析
+
+```{r}
+#| label: fig-cv
+#| fig-cap: "**蛋白质含量变异系数** Coefficient of variation (CV%) of protein content by organ and variety across growth stages. X-axis: growth stage; Y-axis: CV (%); lines connect organ-specific CV values; facets separate the two varieties."
+#| fig-width: 10
+#| fig-height: 5
+
+cv_data <- df |>
+  group_by(variety_en, stage, organ) |>
+  summarise(
+    cv = sd(protein_content) / mean(protein_content) * 100,
+    .groups = "drop"
+  )
+
+p_cv <- ggplot(cv_data, aes(x = stage, y = cv, color = organ, group = organ)) +
+  geom_point(size = 2) +
+  geom_line(linewidth = 0.7) +
+  facet_wrap(~ variety_en, ncol = 2) +
+  scale_color_manual(values = organ_colors) +
+  labs(x = "Growth stage", y = "CV (%)", color = "Organ",
+       title = "Coefficient of variation across stages") +
+  theme_bw(base_size = 13) +
+  theme(legend.position = "bottom")
+
+p_cv
+ggsave(file.path(fig_dir, "fig-cv.png"), p_cv, width = 10, height = 5, dpi = 300)
+export::graph2ppt(p_cv, file = pptx_file, width = 10, height = 5, append = TRUE)
+```
+
+```{r}
+#| label: result-cv
+#| results: asis
+#| eval: true
+
+show_interpretation("fig-cv")
+```
+
+
+## 全株蛋白质积累趋势
+
+```{r}
+#| label: fig-total-protein
+#| fig-cap: "**全株平均蛋白质含量变化** Whole-plant average protein content across growth stages for HY122 and ZD958. X-axis: growth stage; Y-axis: mean protein content (mg/g); error bars represent standard error; red: HY122; blue: ZD958."
+#| fig-width: 8
+#| fig-height: 5
+
+total_means <- df |>
+  group_by(variety_en, stage) |>
+  summarise(
+    total_mean = mean(protein_content),
+    se         = sd(protein_content) / sqrt(n()),
+    .groups = "drop"
+  )
+
+p_total <- ggplot(total_means, aes(x = stage, y = total_mean,
+                         color = variety_en, group = variety_en)) +
+  geom_point(size = 3) +
+  geom_line(linewidth = 1) +
+  geom_errorbar(aes(ymin = total_mean - se, ymax = total_mean + se),
+                width = 0.15, linewidth = 0.6) +
+  scale_color_manual(values = c("HY122" = "#E41A1C", "ZD958" = "#377EB8")) +
+  labs(x = "Growth stage", y = "Mean protein content (mg/g)", color = "Variety",
+       title = "Whole-plant average protein content trend") +
+  theme_bw(base_size = 13) +
+  theme(legend.position = "bottom")
+
+p_total
+ggsave(file.path(fig_dir, "fig-total-protein.png"), p_total, width = 8, height = 5, dpi = 300)
+export::graph2ppt(p_total, file = pptx_file, width = 8, height = 5, append = TRUE)
+```
+
+```{r}
+#| label: result-total-protein
+#| results: asis
+#| eval: true
+
+show_interpretation("fig-total-protein")
+```
